@@ -98,7 +98,11 @@ impl DeviceRegistry {
                     "zxtouch": device.status.zxtouch,
                     "script": device.status.script,
                 }),
-                capabilities: vec!["stream_mpegts_ws".to_string(), "zxtouch".to_string()],
+                capabilities: vec![
+                    "stream_mpegts_ws".to_string(),
+                    "stream_h264_ws".to_string(),
+                    "zxtouch".to_string(),
+                ],
             });
         }
 
