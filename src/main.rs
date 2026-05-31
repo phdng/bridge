@@ -207,6 +207,10 @@ async fn handle_ios_stream(mut ws: WebSocket, ip: String, port: u16) {
     let tcp_to_ws = tokio::spawn(async move {
         // Smaller chunks reduce end-to-end buffering latency.
         let mut buf = vec![0u8; 8 * 1024];
+        let mut stat_bytes: u64 = 0;
+        let mut stat_chunks: u64 = 0;
+        let mut stat_send_us: u128 = 0;
+        let mut stat_at = Instant::now();
         loop {
             tokio::select! {
                 _ = cancel_writer.cancelled() => break,
@@ -215,8 +219,28 @@ async fn handle_ios_stream(mut ws: WebSocket, ip: String, port: u16) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
+                    let send_start = Instant::now();
                     if ws_writer.send(Message::binary(buf[..n].to_vec())).await.is_err() {
                         break;
+                    }
+                    if port == 7003 {
+                        stat_bytes += n as u64;
+                        stat_chunks += 1;
+                        stat_send_us += send_start.elapsed().as_micros();
+                        let elapsed = stat_at.elapsed();
+                        if elapsed >= Duration::from_secs(3) {
+                            let secs = elapsed.as_secs_f64();
+                            let kbps = (stat_bytes as f64 * 8.0 / 1000.0) / secs;
+                            let avg_send_us = if stat_chunks == 0 { 0.0 } else { stat_send_us as f64 / stat_chunks as f64 };
+                            println!(
+                                "ios_h264_relay port=7003 kbps={:.0} chunks={} avg_ws_send_us={:.1}",
+                                kbps, stat_chunks, avg_send_us
+                            );
+                            stat_bytes = 0;
+                            stat_chunks = 0;
+                            stat_send_us = 0;
+                            stat_at = Instant::now();
+                        }
                     }
                 }
             }
