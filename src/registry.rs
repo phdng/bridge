@@ -101,6 +101,7 @@ impl DeviceRegistry {
                 capabilities: vec![
                     "stream_mpegts_ws".to_string(),
                     "stream_h264_ws".to_string(),
+                    "stream_h264_worker_ws".to_string(),
                     "zxtouch".to_string(),
                 ],
             });
