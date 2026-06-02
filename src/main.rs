@@ -155,6 +155,20 @@ async fn ios_h264_handler(
     Ok(ws.on_upgrade(move |socket| handle_ios_stream(socket, device.ip, 7003)))
 }
 
+async fn ios_h264_worker_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, Response> {
+    let device = state
+        .registry
+        .get_ios_device(&id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
+
+    Ok(ws.on_upgrade(move |socket| handle_ios_stream(socket, device.ip, 7004)))
+}
+
 async fn ios_zxtouch_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -410,6 +424,7 @@ async fn main() {
         .route("/ios/{id}/stream", get(ios_stream_handler))
         .route("/ios/{id}/stream-eco", get(ios_stream_eco_handler))
         .route("/ios/{id}/h264", get(ios_h264_handler))
+        .route("/ios/{id}/h264-worker", get(ios_h264_worker_handler))
         .route("/ios/{id}/zxtouch", get(ios_zxtouch_handler))
         .nest(
             "/bridge",
