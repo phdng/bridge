@@ -413,68 +413,26 @@ async fn stream_ios_h264_to_rtc(
             .unwrap_or(33_000);
         last_pts_us = Some(frame.timestamp_us);
 
-        let nals = split_annex_b_nals(&frame.payload);
-        if nals.is_empty() {
+        if frame.payload.is_empty() {
             continue;
         }
 
-        for (index, nal) in nals.iter().enumerate() {
-            let duration = if index + 1 == nals.len() {
-                Duration::from_micros(duration_us)
-            } else {
-                Duration::from_micros(0)
-            };
-
-            if video_track
-                .write_sample(&Sample {
-                    data: MediaBytes::copy_from_slice(nal),
-                    duration,
-                    ..Default::default()
-                })
-                .await
-                .is_err()
-            {
-                let _ = peer_connection.close().await;
-                return;
-            }
+        if video_track
+            .write_sample(&Sample {
+                data: MediaBytes::from(frame.payload),
+                duration: Duration::from_micros(duration_us),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        {
+            let _ = peer_connection.close().await;
+            return;
         }
     }
 
     println!("[ios-rtc] close tcp {port} profile={profile}");
     let _ = peer_connection.close().await;
-}
-
-fn split_annex_b_nals(payload: &[u8]) -> Vec<&[u8]> {
-    let mut nals = Vec::new();
-    let mut current_start: Option<usize> = None;
-    let mut i = 0;
-
-    while i + 3 <= payload.len() {
-        let start_code_len = if i + 4 <= payload.len() && &payload[i..i + 4] == b"\0\0\0\x01" {
-            4
-        } else if &payload[i..i + 3] == b"\0\0\x01" {
-            3
-        } else {
-            i += 1;
-            continue;
-        };
-
-        if let Some(start) = current_start {
-            if start < i {
-                nals.push(&payload[start..i]);
-            }
-        }
-        current_start = Some(i + start_code_len);
-        i += start_code_len;
-    }
-
-    if let Some(start) = current_start {
-        if start < payload.len() {
-            nals.push(&payload[start..]);
-        }
-    }
-
-    nals
 }
 
 struct ZxhFrame {
