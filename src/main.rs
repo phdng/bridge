@@ -395,7 +395,7 @@ async fn stream_ios_h264_to_rtc(
     };
     let _ = stream.set_nodelay(true);
     let mut reader = stream;
-    let mut last_pts_us: Option<u64> = None;
+    let sample_duration = rtc_sample_duration_for_profile(&profile);
 
     loop {
         let frame = tokio::select! {
@@ -408,11 +408,6 @@ async fn stream_ios_h264_to_rtc(
             Ok(None) | Err(_) => break,
         };
 
-        let duration_us = last_pts_us
-            .map(|last| frame.timestamp_us.saturating_sub(last).clamp(1_000, 100_000))
-            .unwrap_or(33_000);
-        last_pts_us = Some(frame.timestamp_us);
-
         if frame.payload.is_empty() {
             continue;
         }
@@ -420,7 +415,7 @@ async fn stream_ios_h264_to_rtc(
         if video_track
             .write_sample(&Sample {
                 data: MediaBytes::from(frame.payload),
-                duration: Duration::from_micros(duration_us),
+                duration: sample_duration,
                 ..Default::default()
             })
             .await
@@ -433,6 +428,14 @@ async fn stream_ios_h264_to_rtc(
 
     println!("[ios-rtc] close tcp {port} profile={profile}");
     let _ = peer_connection.close().await;
+}
+
+fn rtc_sample_duration_for_profile(profile: &str) -> Duration {
+    match profile {
+        // Keep RTP pacing stable. Capture timestamps can jitter during zxtouch input.
+        "lan" | "wan" => Duration::from_micros(33_333),
+        _ => Duration::from_micros(33_333),
+    }
 }
 
 struct ZxhFrame {
@@ -602,7 +605,44 @@ async fn handle_ios_zxtouch(mut ws: WebSocket, ip: String) {
     let cancel = CancellationToken::new();
     let cancel_reader = cancel.clone();
     let cancel_writer = cancel.clone();
+    let cancel_move = cancel.clone();
+    let cancel_command_writer = cancel.clone();
+    let (command_tx, mut command_rx) = channel::<Vec<u8>>(64);
+    let latest_move = Arc::new(Mutex::new(None::<Vec<u8>>));
 
+    let command_writer = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_command_writer.cancelled() => break,
+                command = command_rx.recv() => {
+                    let Some(command) = command else { break; };
+                    if tcp_writer.write_all(&command).await.is_err() { break; }
+                }
+            }
+        }
+        cancel_command_writer.cancel();
+    });
+
+    let latest_move_for_pump = Arc::clone(&latest_move);
+    let command_tx_for_pump = command_tx.clone();
+    let move_pump = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                _ = cancel_move.cancelled() => break,
+                _ = tick.tick() => {
+                    let command = latest_move_for_pump.lock().await.take();
+                    if let Some(command) = command {
+                        if command_tx_for_pump.send(command).await.is_err() { break; }
+                    }
+                }
+            }
+        }
+        cancel_move.cancel();
+    });
+
+    let latest_move_for_reader = Arc::clone(&latest_move);
+    let command_tx_for_reader = command_tx.clone();
     let ws_to_tcp = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -610,10 +650,10 @@ async fn handle_ios_zxtouch(mut ws: WebSocket, ip: String) {
                 message = ws_reader.next() => {
                     match message {
                         Some(Ok(Message::Binary(buf))) => {
-                            if tcp_writer.write_all(&buf).await.is_err() { break; }
+                            if forward_ios_zxtouch_command(buf.to_vec(), &latest_move_for_reader, &command_tx_for_reader).await.is_err() { break; }
                         }
                         Some(Ok(Message::Text(text))) => {
-                            if tcp_writer.write_all(text.as_bytes()).await.is_err() { break; }
+                            if forward_ios_zxtouch_command(text.as_bytes().to_vec(), &latest_move_for_reader, &command_tx_for_reader).await.is_err() { break; }
                         }
                         Some(Ok(Message::Close(_))) | None => break,
                         Some(Ok(_)) => {}
@@ -644,7 +684,23 @@ async fn handle_ios_zxtouch(mut ws: WebSocket, ip: String) {
         cancel_writer.cancel();
     });
 
-    let _ = tokio::join!(ws_to_tcp, tcp_to_ws);
+    let _ = tokio::join!(ws_to_tcp, command_writer, move_pump, tcp_to_ws);
+}
+
+async fn forward_ios_zxtouch_command(
+    command: Vec<u8>,
+    latest_move: &Arc<Mutex<Option<Vec<u8>>>>,
+    command_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> Result<(), ()> {
+    if command.starts_with(b"1012") {
+        *latest_move.lock().await = Some(command);
+        return Ok(());
+    }
+
+    if let Some(move_command) = latest_move.lock().await.take() {
+        command_tx.send(move_command).await.map_err(|_| ())?;
+    }
+    command_tx.send(command).await.map_err(|_| ())
 }
 
 const ARG_AUTO_RUN: &str = "--auto-run";
