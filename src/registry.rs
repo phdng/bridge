@@ -102,6 +102,7 @@ impl DeviceRegistry {
                     "stream_mpegts_ws".to_string(),
                     "stream_h264_ws".to_string(),
                     "stream_h264_worker_ws".to_string(),
+                    "stream_rtc_auto".to_string(),
                     "zxtouch".to_string(),
                 ],
             });
