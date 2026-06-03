@@ -492,7 +492,14 @@ async fn ios_zxtouch_handler(
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
 
-    Ok(ws.on_upgrade(move |socket| handle_ios_zxtouch(socket, device.ip)))
+    let registry = Arc::clone(&state.registry);
+    Ok(ws.on_upgrade(move |socket| async move {
+        registry.begin_ios_control();
+        println!("[ios-zxtouch] control opened {id}");
+        handle_ios_zxtouch(socket, device.ip).await;
+        println!("[ios-zxtouch] control closed {id}");
+        registry.end_ios_control();
+    }))
 }
 
 async fn handle_ios_stream(mut ws: WebSocket, ip: String, port: u16) {
