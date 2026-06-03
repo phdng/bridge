@@ -3,7 +3,7 @@
 use std::{
     env,
     future::IntoFuture,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -16,9 +16,10 @@ use axum::{
         Path, Request, State, WebSocketUpgrade,
     },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
+use bytes::Bytes as MediaBytes;
 use futures_util::{SinkExt, StreamExt};
 use http::{Method, StatusCode};
 use reqwest::Url;
@@ -43,6 +44,19 @@ mod registry;
 use ios_lan_scanner::IosLanScanner;
 use ios_provider::IosProvider;
 use registry::DeviceRegistry;
+
+use webrtc::{
+    api::{interceptor_registry::register_default_interceptors, media_engine::{MediaEngine, MIME_TYPE_H264}, APIBuilder},
+    interceptor::registry::Registry,
+    media::Sample,
+    peer_connection::{
+        configuration::RTCConfiguration,
+        peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription,
+    },
+    rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
+    track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
+};
 
 fn start_browser() {
     open::that_detached("https://app.tangoapp.dev/?desktop=true").unwrap();
@@ -167,6 +181,247 @@ async fn ios_h264_worker_handler(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
 
     Ok(ws.on_upgrade(move |socket| handle_ios_stream(socket, device.ip, 7004)))
+}
+
+async fn ios_rtc_offer_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(offer): Json<RTCSessionDescription>,
+) -> Result<Json<RTCSessionDescription>, Response> {
+    let device = state
+        .registry
+        .get_ios_device(&id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
+
+    let answer = create_ios_rtc_answer(device.ip, offer)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e).into_response())?;
+
+    Ok(Json(answer))
+}
+
+async fn create_ios_rtc_answer(
+    ip: String,
+    offer: RTCSessionDescription,
+) -> Result<RTCSessionDescription, String> {
+    let mut media_engine = MediaEngine::default();
+    media_engine
+        .register_default_codecs()
+        .map_err(|e| format!("register codecs: {e}"))?;
+
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut media_engine)
+        .map_err(|e| format!("register interceptors: {e}"))?;
+
+    let api = APIBuilder::new()
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .build();
+
+    let config = RTCConfiguration::default();
+
+    let peer_connection = Arc::new(
+        api.new_peer_connection(config)
+            .await
+            .map_err(|e| format!("new peer connection: {e}"))?,
+    );
+
+    let video_track = Arc::new(TrackLocalStaticSample::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            ..Default::default()
+        },
+        "ios-video".to_string(),
+        "zxtouch".to_string(),
+    ));
+
+    let rtp_sender = peer_connection
+        .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await
+        .map_err(|e| format!("add video track: {e}"))?;
+
+    tokio::spawn(async move {
+        let mut rtcp_buf = vec![0u8; 1500];
+        while rtp_sender.read(&mut rtcp_buf).await.is_ok() {}
+    });
+
+    let pc_for_state = Arc::clone(&peer_connection);
+    peer_connection.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+        let pc = Arc::clone(&pc_for_state);
+        Box::pin(async move {
+            if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
+                let _ = pc.close().await;
+            }
+        })
+    }));
+
+    peer_connection
+        .set_remote_description(offer)
+        .await
+        .map_err(|e| format!("set remote description: {e}"))?;
+
+    let answer = peer_connection
+        .create_answer(None)
+        .await
+        .map_err(|e| format!("create answer: {e}"))?;
+    let mut gather_complete = peer_connection.gathering_complete_promise().await;
+    peer_connection
+        .set_local_description(answer)
+        .await
+        .map_err(|e| format!("set local description: {e}"))?;
+    let _ = tokio::time::timeout(Duration::from_secs(3), gather_complete.recv()).await;
+
+    let local_desc = peer_connection
+        .local_description()
+        .await
+        .ok_or_else(|| "missing local description".to_string())?;
+
+    tokio::spawn(stream_ios_h264_to_rtc(
+        ip,
+        Arc::clone(&peer_connection),
+        video_track,
+    ));
+
+    Ok(local_desc)
+}
+
+async fn stream_ios_h264_to_rtc(
+    ip: String,
+    peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    video_track: Arc<TrackLocalStaticSample>,
+) {
+    let addr = format!("{}:7003", ip);
+    let stream = match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        _ => {
+            let _ = peer_connection.close().await;
+            return;
+        }
+    };
+    let _ = stream.set_nodelay(true);
+    let mut reader = stream;
+    let mut last_pts_us: Option<u64> = None;
+
+    loop {
+        let frame = match read_zxh_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) | Err(_) => break,
+        };
+
+        let duration_us = last_pts_us
+            .map(|last| frame.timestamp_us.saturating_sub(last).clamp(1_000, 100_000))
+            .unwrap_or(33_000);
+        last_pts_us = Some(frame.timestamp_us);
+
+        let nals = split_annex_b_nals(&frame.payload);
+        if nals.is_empty() {
+            continue;
+        }
+
+        for (index, nal) in nals.iter().enumerate() {
+            let duration = if index + 1 == nals.len() {
+                Duration::from_micros(duration_us)
+            } else {
+                Duration::from_micros(0)
+            };
+
+            if video_track
+                .write_sample(&Sample {
+                    data: MediaBytes::copy_from_slice(nal),
+                    duration,
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+            {
+                let _ = peer_connection.close().await;
+                return;
+            }
+        }
+    }
+
+    let _ = peer_connection.close().await;
+}
+
+fn split_annex_b_nals(payload: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    let mut current_start: Option<usize> = None;
+    let mut i = 0;
+
+    while i + 3 <= payload.len() {
+        let start_code_len = if i + 4 <= payload.len() && &payload[i..i + 4] == b"\0\0\0\1" {
+            4
+        } else if &payload[i..i + 3] == b"\0\0\1" {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+
+        if let Some(start) = current_start {
+            if start < i {
+                nals.push(&payload[start..i]);
+            }
+        }
+        current_start = Some(i + start_code_len);
+        i += start_code_len;
+    }
+
+    if let Some(start) = current_start {
+        if start < payload.len() {
+            nals.push(&payload[start..]);
+        }
+    }
+
+    nals
+}
+
+struct ZxhFrame {
+    timestamp_us: u64,
+    payload: Vec<u8>,
+}
+
+async fn read_zxh_frame(reader: &mut TcpStream) -> Result<Option<ZxhFrame>, std::io::Error> {
+    let mut magic = [0u8; 4];
+    match reader.read_exact(&mut magic).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    if &magic[..3] != b"ZXH" {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad zxh magic"));
+    }
+
+    let (timestamp_us, payload_len) = match magic[3] {
+        b'2' => {
+            let mut rest = [0u8; 48];
+            reader.read_exact(&mut rest).await?;
+            let ts = u64::from_be_bytes(rest[12..20].try_into().unwrap_or([0; 8]));
+            let payload_len = u32::from_be_bytes(rest[44..48].try_into().unwrap_or([0; 4])) as usize;
+            (ts, payload_len)
+        }
+        b'1' => {
+            let mut rest = [0u8; 16];
+            reader.read_exact(&mut rest).await?;
+            let ts = u64::from_be_bytes(rest[4..12].try_into().unwrap_or([0; 8]));
+            let payload_len = u32::from_be_bytes(rest[12..16].try_into().unwrap_or([0; 4])) as usize;
+            (ts, payload_len)
+        }
+        _ => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad zxh version"));
+        }
+    };
+
+    if payload_len == 0 || payload_len > 4 * 1024 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad zxh payload len"));
+    }
+
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await?;
+    Ok(Some(ZxhFrame { timestamp_us, payload }))
 }
 
 async fn ios_zxtouch_handler(
@@ -425,6 +680,7 @@ async fn main() {
         .route("/ios/{id}/stream-eco", get(ios_stream_eco_handler))
         .route("/ios/{id}/h264", get(ios_h264_handler))
         .route("/ios/{id}/h264-worker", get(ios_h264_worker_handler))
+        .route("/ios/{id}/rtc/offer", post(ios_rtc_offer_handler))
         .route("/ios/{id}/zxtouch", get(ios_zxtouch_handler))
         .nest(
             "/bridge",
