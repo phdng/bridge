@@ -24,6 +24,8 @@ use bytes::Bytes as MediaBytes;
 use futures_util::{SinkExt, StreamExt};
 use http::{Method, StatusCode};
 use reqwest::Url;
+use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use tao::event_loop::EventLoopBuilder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -125,6 +127,19 @@ struct AppState {
     rtc_sessions: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 
+#[derive(Deserialize)]
+struct IosRtcOfferRequest {
+    sdp: RTCSessionDescription,
+    profile: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IosRtcOfferResponse {
+    sdp: RTCSessionDescription,
+    profile: String,
+    port: u16,
+}
+
 async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
     let devices = state.registry.list_unified_devices().await;
     Json(devices)
@@ -189,13 +204,16 @@ async fn ios_h264_worker_handler(
 async fn ios_rtc_offer_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(offer): Json<RTCSessionDescription>,
-) -> Result<Json<RTCSessionDescription>, Response> {
+    Json(request): Json<IosRtcOfferRequest>,
+) -> Result<Json<IosRtcOfferResponse>, Response> {
     let device = state
         .registry
         .get_ios_device(&id)
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
+
+    let (profile, port) = select_ios_rtc_profile(&device.ip, request.profile.as_deref());
+    println!("[ios-rtc] selected profile={profile} port={port} ip={}", device.ip);
 
     let rtc_cancel = CancellationToken::new();
     if let Some(previous) = state
@@ -207,7 +225,7 @@ async fn ios_rtc_offer_handler(
         previous.cancel();
     }
 
-    let answer = match create_ios_rtc_answer(device.ip, offer, rtc_cancel).await {
+    let answer = match create_ios_rtc_answer(device.ip, request.sdp, rtc_cancel, port, profile.clone()).await {
         Ok(answer) => answer,
         Err(e) => {
             if let Some(cancel) = state.rtc_sessions.lock().await.remove(&id) {
@@ -217,7 +235,7 @@ async fn ios_rtc_offer_handler(
         }
     };
 
-    Ok(Json(answer))
+    Ok(Json(IosRtcOfferResponse { sdp: answer, profile, port }))
 }
 
 async fn ios_rtc_close_handler(
@@ -231,10 +249,34 @@ async fn ios_rtc_close_handler(
     StatusCode::NO_CONTENT
 }
 
+fn select_ios_rtc_profile(ip: &str, requested: Option<&str>) -> (String, u16) {
+    match requested.unwrap_or("auto").to_ascii_lowercase().as_str() {
+        "lan" => ("lan".to_string(), 7005),
+        "wan" => ("wan".to_string(), 7006),
+        _ if is_lan_candidate_ip(ip) => ("lan".to_string(), 7005),
+        _ => ("wan".to_string(), 7006),
+    }
+}
+
+fn is_lan_candidate_ip(ip: &str) -> bool {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local()
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let first = v6.segments()[0];
+            v6.is_loopback() || (first & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
 async fn create_ios_rtc_answer(
     ip: String,
     offer: RTCSessionDescription,
     rtc_cancel: CancellationToken,
+    port: u16,
+    profile: String,
 ) -> Result<RTCSessionDescription, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -326,6 +368,8 @@ async fn create_ios_rtc_answer(
         Arc::clone(&peer_connection),
         video_track,
         rtc_cancel,
+        port,
+        profile,
     ));
 
     Ok(local_desc)
@@ -336,9 +380,11 @@ async fn stream_ios_h264_to_rtc(
     peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticSample>,
     cancel: CancellationToken,
+    port: u16,
+    profile: String,
 ) {
-    let addr = format!("{}:7003", ip);
-    println!("[ios-rtc] open tcp {addr}");
+    let addr = format!("{}:{}", ip, port);
+    println!("[ios-rtc] open tcp {addr} profile={profile}");
     let stream = match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         _ => {
@@ -394,7 +440,7 @@ async fn stream_ios_h264_to_rtc(
         }
     }
 
-    println!("[ios-rtc] close tcp 7003");
+    println!("[ios-rtc] close tcp {port} profile={profile}");
     let _ = peer_connection.close().await;
 }
 
