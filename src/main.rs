@@ -251,9 +251,9 @@ async fn ios_rtc_close_handler(
 
 fn select_ios_rtc_profile(ip: &str, requested: Option<&str>) -> (String, u16) {
     match requested.unwrap_or("auto").to_ascii_lowercase().as_str() {
-        "lan" => ("lan".to_string(), 7005),
+        "lan" => ("lan".to_string(), 7003),
         "wan" => ("wan".to_string(), 7006),
-        _ if is_lan_candidate_ip(ip) => ("lan".to_string(), 7005),
+        _ if is_lan_candidate_ip(ip) => ("lan".to_string(), 7003),
         _ => ("wan".to_string(), 7006),
     }
 }
