@@ -395,7 +395,8 @@ async fn stream_ios_h264_to_rtc(
     };
     let _ = stream.set_nodelay(true);
     let mut reader = stream;
-    let sample_duration = rtc_sample_duration_for_profile(&profile);
+    let mut last_frame_at: Option<Instant> = None;
+    let mut sample_duration_us = rtc_initial_sample_duration_us(&profile);
 
     loop {
         let frame = tokio::select! {
@@ -412,10 +413,20 @@ async fn stream_ios_h264_to_rtc(
             continue;
         }
 
+        let now = Instant::now();
+        if let Some(last) = last_frame_at {
+            let observed_us = now.duration_since(last).as_micros() as f64;
+            // Track real source pacing smoothly. During zxtouch input, capture can dip below
+            // 30fps; fixed 30fps RTP timestamps make the browser grow its jitter buffer.
+            let bounded_us = observed_us.clamp(30_000.0, 60_000.0);
+            sample_duration_us = (sample_duration_us * 0.80) + (bounded_us * 0.20);
+        }
+        last_frame_at = Some(now);
+
         if video_track
             .write_sample(&Sample {
                 data: MediaBytes::from(frame.payload),
-                duration: sample_duration,
+                duration: Duration::from_micros(sample_duration_us.round() as u64),
                 ..Default::default()
             })
             .await
@@ -430,11 +441,10 @@ async fn stream_ios_h264_to_rtc(
     let _ = peer_connection.close().await;
 }
 
-fn rtc_sample_duration_for_profile(profile: &str) -> Duration {
+fn rtc_initial_sample_duration_us(profile: &str) -> f64 {
     match profile {
-        // Keep RTP pacing stable. Capture timestamps can jitter during zxtouch input.
-        "lan" | "wan" => Duration::from_micros(33_333),
-        _ => Duration::from_micros(33_333),
+        "lan" | "wan" => 33_333.0,
+        _ => 33_333.0,
     }
 }
 
