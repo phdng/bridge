@@ -351,9 +351,9 @@ fn split_annex_b_nals(payload: &[u8]) -> Vec<&[u8]> {
     let mut i = 0;
 
     while i + 3 <= payload.len() {
-        let start_code_len = if i + 4 <= payload.len() && &payload[i..i + 4] == b"\0\0\0\1" {
+        let start_code_len = if i + 4 <= payload.len() && &payload[i..i + 4] == b"\0\0\0\x01" {
             4
-        } else if &payload[i..i + 3] == b"\0\0\1" {
+        } else if &payload[i..i + 3] == b"\0\0\x01" {
             3
         } else {
             i += 1;
