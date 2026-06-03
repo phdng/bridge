@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
+    collections::HashMap,
     env,
     future::IntoFuture,
     sync::{Arc, OnceLock},
@@ -27,7 +28,7 @@ use tao::event_loop::EventLoopBuilder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::mpsc::channel,
+    sync::{mpsc::channel, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
@@ -47,6 +48,7 @@ use registry::DeviceRegistry;
 
 use webrtc::{
     api::{interceptor_registry::register_default_interceptors, media_engine::{MediaEngine, MIME_TYPE_H264}, APIBuilder},
+    ice_transport::ice_connection_state::RTCIceConnectionState,
     interceptor::registry::Registry,
     media::Sample,
     peer_connection::{
@@ -120,6 +122,7 @@ async fn handle_websocket(ws: WebSocket) {
 #[derive(Clone)]
 struct AppState {
     registry: std::sync::Arc<DeviceRegistry>,
+    rtc_sessions: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 
 async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
@@ -194,16 +197,44 @@ async fn ios_rtc_offer_handler(
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
 
-    let answer = create_ios_rtc_answer(device.ip, offer)
+    let rtc_cancel = CancellationToken::new();
+    if let Some(previous) = state
+        .rtc_sessions
+        .lock()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e).into_response())?;
+        .insert(id.clone(), rtc_cancel.clone())
+    {
+        previous.cancel();
+    }
+
+    let answer = match create_ios_rtc_answer(device.ip, offer, rtc_cancel).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            if let Some(cancel) = state.rtc_sessions.lock().await.remove(&id) {
+                cancel.cancel();
+            }
+            return Err((StatusCode::BAD_GATEWAY, e).into_response());
+        }
+    };
 
     Ok(Json(answer))
+}
+
+async fn ios_rtc_close_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(cancel) = state.rtc_sessions.lock().await.remove(&id) {
+        println!("[ios-rtc] close requested {id}");
+        cancel.cancel();
+    }
+    StatusCode::NO_CONTENT
 }
 
 async fn create_ios_rtc_answer(
     ip: String,
     offer: RTCSessionDescription,
+    rtc_cancel: CancellationToken,
 ) -> Result<RTCSessionDescription, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -247,12 +278,24 @@ async fn create_ios_rtc_answer(
         while rtp_sender.read(&mut rtcp_buf).await.is_ok() {}
     });
 
-    let pc_for_state = Arc::clone(&peer_connection);
+    let cancel_for_peer_state = rtc_cancel.clone();
     peer_connection.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-        let pc = Arc::clone(&pc_for_state);
+        let cancel = cancel_for_peer_state.clone();
         Box::pin(async move {
-            if matches!(state, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
-                let _ = pc.close().await;
+            println!("[ios-rtc] peer state {state}");
+            if matches!(state, RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
+                cancel.cancel();
+            }
+        })
+    }));
+
+    let cancel_for_ice_state = rtc_cancel.clone();
+    peer_connection.on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
+        let cancel = cancel_for_ice_state.clone();
+        Box::pin(async move {
+            println!("[ios-rtc] ice state {state}");
+            if matches!(state, RTCIceConnectionState::Disconnected | RTCIceConnectionState::Failed | RTCIceConnectionState::Closed) {
+                cancel.cancel();
             }
         })
     }));
@@ -282,6 +325,7 @@ async fn create_ios_rtc_answer(
         ip,
         Arc::clone(&peer_connection),
         video_track,
+        rtc_cancel,
     ));
 
     Ok(local_desc)
@@ -291,11 +335,14 @@ async fn stream_ios_h264_to_rtc(
     ip: String,
     peer_connection: Arc<webrtc::peer_connection::RTCPeerConnection>,
     video_track: Arc<TrackLocalStaticSample>,
+    cancel: CancellationToken,
 ) {
     let addr = format!("{}:7003", ip);
+    println!("[ios-rtc] open tcp {addr}");
     let stream = match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         _ => {
+            println!("[ios-rtc] tcp connect failed");
             let _ = peer_connection.close().await;
             return;
         }
@@ -305,7 +352,12 @@ async fn stream_ios_h264_to_rtc(
     let mut last_pts_us: Option<u64> = None;
 
     loop {
-        let frame = match read_zxh_frame(&mut reader).await {
+        let frame = tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = read_zxh_frame(&mut reader) => result,
+        };
+
+        let frame = match frame {
             Ok(Some(frame)) => frame,
             Ok(None) | Err(_) => break,
         };
@@ -342,6 +394,7 @@ async fn stream_ios_h264_to_rtc(
         }
     }
 
+    println!("[ios-rtc] close tcp 7003");
     let _ = peer_connection.close().await;
 }
 
@@ -681,6 +734,7 @@ async fn main() {
         .route("/ios/{id}/h264", get(ios_h264_handler))
         .route("/ios/{id}/h264-worker", get(ios_h264_worker_handler))
         .route("/ios/{id}/rtc/offer", post(ios_rtc_offer_handler))
+        .route("/ios/{id}/rtc/close", post(ios_rtc_close_handler))
         .route("/ios/{id}/zxtouch", get(ios_zxtouch_handler))
         .nest(
             "/bridge",
@@ -709,7 +763,10 @@ async fn main() {
     );
     let _ios_task = ios_provider.start();
 
-    let app = app.with_state(AppState { registry });
+    let app = app.with_state(AppState {
+        registry,
+        rtc_sessions: Arc::new(Mutex::new(HashMap::new())),
+    });
 
     let mut server = {
         let token = token.clone();
