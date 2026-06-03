@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 
 use serde::Serialize;
 use serde_json::json;
@@ -26,6 +26,7 @@ pub struct DeviceRegistry {
     ios_devices: RwLock<HashMap<String, IosDevice>>,
     android_devices: RwLock<HashMap<String, UnifiedDevice>>,
     events: broadcast::Sender<DeviceEvent>,
+    active_ios_controls: AtomicUsize,
 }
 
 impl DeviceRegistry {
@@ -35,7 +36,22 @@ impl DeviceRegistry {
             ios_devices: RwLock::new(HashMap::new()),
             android_devices: RwLock::new(HashMap::new()),
             events,
+            active_ios_controls: AtomicUsize::new(0),
         })
+    }
+
+    pub fn begin_ios_control(&self) {
+        self.active_ios_controls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn end_ios_control(&self) {
+        let _ = self.active_ios_controls.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
+    }
+
+    pub fn has_active_ios_control(&self) -> bool {
+        self.active_ios_controls.load(Ordering::Relaxed) > 0
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<DeviceEvent> {
