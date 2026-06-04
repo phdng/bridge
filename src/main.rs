@@ -636,7 +636,7 @@ async fn handle_ios_zxtouch(mut ws: WebSocket, ip: String) {
     let latest_move_for_pump = Arc::clone(&latest_move);
     let command_tx_for_pump = command_tx.clone();
     let move_pump = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
                 _ = cancel_move.cancelled() => break,
