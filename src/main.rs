@@ -52,6 +52,7 @@ use webrtc::{
     api::{interceptor_registry::register_default_interceptors, media_engine::{MediaEngine, MIME_TYPE_H264}, APIBuilder},
     ice_transport::{
         ice_connection_state::RTCIceConnectionState,
+        ice_credential_type::RTCIceCredentialType,
         ice_server::RTCIceServer,
     },
     interceptor::registry::Registry,
@@ -377,7 +378,11 @@ fn to_webrtc_config(config: &RtcIceConfigResponse) -> RTCConfiguration {
             urls: server.urls.clone(),
             username: server.username.clone().unwrap_or_default(),
             credential: server.credential.clone().unwrap_or_default(),
-            ..Default::default()
+            credential_type: if server.username.is_some() || server.credential.is_some() {
+                RTCIceCredentialType::Password
+            } else {
+                RTCIceCredentialType::Unspecified
+            },
         })
         .collect();
 
