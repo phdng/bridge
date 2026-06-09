@@ -14,7 +14,7 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket},
-        Path, Request, State, WebSocketUpgrade,
+        Path, Query, Request, State, WebSocketUpgrade,
     },
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -50,11 +50,15 @@ use registry::DeviceRegistry;
 
 use webrtc::{
     api::{interceptor_registry::register_default_interceptors, media_engine::{MediaEngine, MIME_TYPE_H264}, APIBuilder},
-    ice_transport::ice_connection_state::RTCIceConnectionState,
+    ice_transport::{
+        ice_connection_state::RTCIceConnectionState,
+        ice_server::RTCIceServer,
+    },
     interceptor::registry::Registry,
     media::Sample,
     peer_connection::{
         configuration::RTCConfiguration,
+        policy::ice_transport_policy::RTCIceTransportPolicy,
         peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription,
     },
@@ -125,12 +129,15 @@ async fn handle_websocket(ws: WebSocket) {
 struct AppState {
     registry: std::sync::Arc<DeviceRegistry>,
     rtc_sessions: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    rtc_ice: Arc<RtcIceService>,
 }
 
 #[derive(Deserialize)]
 struct IosRtcOfferRequest {
     sdp: RTCSessionDescription,
     profile: Option<String>,
+    #[serde(rename = "iceTransportPolicy")]
+    ice_transport_policy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +145,192 @@ struct IosRtcOfferResponse {
     sdp: RTCSessionDescription,
     profile: String,
     port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RtcIceConfigResponse {
+    ice_servers: Vec<RtcIceServerConfig>,
+    ice_transport_policy: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RtcIceServerConfig {
+    urls: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RtcConfigQuery {
+    force_relay: Option<String>,
+}
+
+struct RtcIceCache {
+    config: RtcIceConfigResponse,
+    expires_at: Instant,
+}
+
+struct RtcIceService {
+    client: reqwest::Client,
+    cf_app_id: Option<String>,
+    cf_api_token: Option<String>,
+    turn_enabled: bool,
+    ttl: u64,
+    refresh_skew: u64,
+    fallback_stun_urls: Vec<String>,
+    cache: Mutex<Option<RtcIceCache>>,
+}
+
+impl RtcIceService {
+    fn from_env() -> Self {
+        let turn_enabled = env::var("RTC_TURN_ENABLED")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        let ttl = env::var("CF_TURN_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86_400);
+        let refresh_skew = env::var("RTC_TURN_REFRESH_SKEW_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let fallback_stun_urls = env::var("RTC_STUN_URLS")
+            .unwrap_or_else(|_| "stun:stun.cloudflare.com:3478,stun:stun.cloudflare.com:53".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        Self {
+            client: reqwest::Client::new(),
+            cf_app_id: env::var("CF_TURN_APP_ID").ok().filter(|v| !v.is_empty()),
+            cf_api_token: env::var("CF_TURN_API_TOKEN").ok().filter(|v| !v.is_empty()),
+            turn_enabled,
+            ttl,
+            refresh_skew,
+            fallback_stun_urls,
+            cache: Mutex::new(None),
+        }
+    }
+
+    async fn config(&self, force_relay: bool) -> RtcIceConfigResponse {
+        let mut config = if self.turn_enabled {
+            match self.cloudflare_config().await {
+                Ok(config) => config,
+                Err(e) => {
+                    println!("[rtc-ice] cloudflare TURN config failed: {e}; using STUN fallback");
+                    self.stun_fallback_config()
+                }
+            }
+        } else {
+            self.stun_fallback_config()
+        };
+
+        config.ice_transport_policy = if force_relay { "relay" } else { "all" }.to_string();
+        config
+    }
+
+    async fn cloudflare_config(&self) -> Result<RtcIceConfigResponse, String> {
+        let app_id = self
+            .cf_app_id
+            .as_deref()
+            .ok_or_else(|| "missing CF_TURN_APP_ID".to_string())?;
+        let api_token = self
+            .cf_api_token
+            .as_deref()
+            .ok_or_else(|| "missing CF_TURN_API_TOKEN".to_string())?;
+
+        let now = Instant::now();
+        {
+            let cache = self.cache.lock().await;
+            if let Some(cache) = cache.as_ref() {
+                if now < cache.expires_at {
+                    return Ok(cache.config.clone());
+                }
+            }
+        }
+
+        #[derive(Serialize)]
+        struct TurnRequest {
+            ttl: u64,
+        }
+
+        let url = format!(
+            "https://rtc.live.cloudflare.com/v1/turn/keys/{app_id}/credentials/generate-ice-servers"
+        );
+        let config = self
+            .client
+            .post(url)
+            .bearer_auth(api_token)
+            .json(&TurnRequest { ttl: self.ttl })
+            .send()
+            .await
+            .map_err(|e| format!("request: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("status: {e}"))?
+            .json::<RtcIceConfigResponse>()
+            .await
+            .map_err(|e| format!("decode: {e}"))?;
+
+        let valid_for = self.ttl.saturating_sub(self.refresh_skew).max(60);
+        let mut cache = self.cache.lock().await;
+        *cache = Some(RtcIceCache {
+            config: config.clone(),
+            expires_at: Instant::now() + Duration::from_secs(valid_for),
+        });
+        Ok(config)
+    }
+
+    fn stun_fallback_config(&self) -> RtcIceConfigResponse {
+        let ice_servers = if self.fallback_stun_urls.is_empty() {
+            Vec::new()
+        } else {
+            vec![RtcIceServerConfig {
+                urls: self.fallback_stun_urls.clone(),
+                username: None,
+                credential: None,
+            }]
+        };
+        RtcIceConfigResponse {
+            ice_servers,
+            ice_transport_policy: "all".to_string(),
+        }
+    }
+}
+
+fn parse_force_relay(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn to_webrtc_config(config: &RtcIceConfigResponse) -> RTCConfiguration {
+    let ice_servers = config
+        .ice_servers
+        .iter()
+        .map(|server| RTCIceServer {
+            urls: server.urls.clone(),
+            username: server.username.clone().unwrap_or_default(),
+            credential: server.credential.clone().unwrap_or_default(),
+            ..Default::default()
+        })
+        .collect();
+
+    let ice_transport_policy = if config.ice_transport_policy == "relay" {
+        RTCIceTransportPolicy::Relay
+    } else {
+        RTCIceTransportPolicy::All
+    };
+
+    RTCConfiguration {
+        ice_servers,
+        ice_transport_policy,
+        ..Default::default()
+    }
 }
 
 async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
@@ -225,7 +418,15 @@ async fn ios_rtc_offer_handler(
         previous.cancel();
     }
 
-    let answer = match create_ios_rtc_answer(device.ip, request.sdp, rtc_cancel, port, profile.clone()).await {
+    let force_relay = request.ice_transport_policy.as_deref() == Some("relay");
+    let ice_config = state.rtc_ice.config(force_relay).await;
+    println!(
+        "[ios-rtc] ice servers={} policy={}",
+        ice_config.ice_servers.len(),
+        ice_config.ice_transport_policy
+    );
+
+    let answer = match create_ios_rtc_answer(device.ip, request.sdp, rtc_cancel, port, profile.clone(), ice_config).await {
         Ok(answer) => answer,
         Err(e) => {
             if let Some(cancel) = state.rtc_sessions.lock().await.remove(&id) {
@@ -236,6 +437,14 @@ async fn ios_rtc_offer_handler(
     };
 
     Ok(Json(IosRtcOfferResponse { sdp: answer, profile, port }))
+}
+
+async fn rtc_config_handler(
+    State(state): State<AppState>,
+    Query(query): Query<RtcConfigQuery>,
+) -> Json<RtcIceConfigResponse> {
+    let force_relay = parse_force_relay(query.force_relay.as_deref());
+    Json(state.rtc_ice.config(force_relay).await)
 }
 
 async fn ios_rtc_close_handler(
@@ -277,6 +486,7 @@ async fn create_ios_rtc_answer(
     rtc_cancel: CancellationToken,
     port: u16,
     profile: String,
+    ice_config: RtcIceConfigResponse,
 ) -> Result<RTCSessionDescription, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -292,7 +502,7 @@ async fn create_ios_rtc_answer(
         .with_interceptor_registry(registry)
         .build();
 
-    let config = RTCConfiguration::default();
+    let config = to_webrtc_config(&ice_config);
 
     let peer_connection = Arc::new(
         api.new_peer_connection(config)
@@ -810,6 +1020,7 @@ async fn main() {
         .route("/ios/{id}/stream-eco", get(ios_stream_eco_handler))
         .route("/ios/{id}/h264", get(ios_h264_handler))
         .route("/ios/{id}/h264-worker", get(ios_h264_worker_handler))
+        .route("/rtc/config", get(rtc_config_handler))
         .route("/ios/{id}/rtc/offer", post(ios_rtc_offer_handler))
         .route("/ios/{id}/rtc/close", post(ios_rtc_close_handler))
         .route("/ios/{id}/zxtouch", get(ios_zxtouch_handler))
@@ -843,6 +1054,7 @@ async fn main() {
     let app = app.with_state(AppState {
         registry,
         rtc_sessions: Arc::new(Mutex::new(HashMap::new())),
+        rtc_ice: Arc::new(RtcIceService::from_env()),
     });
 
     let mut server = {
