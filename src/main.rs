@@ -381,15 +381,12 @@ fn to_webrtc_config(config: &RtcIceConfigResponse) -> RTCConfiguration {
         })
         .collect();
 
-    let ice_transport_policy = if config.ice_transport_policy == "relay" {
-        RTCIceTransportPolicy::Relay
-    } else {
-        RTCIceTransportPolicy::All
-    };
-
     RTCConfiguration {
         ice_servers,
-        ice_transport_policy,
+        // Keep the bridge side on All even when the browser is forced to Relay.
+        // The bridge will still gather relay candidates from TURN, while avoiding
+        // webrtc-rs/ICE startup failures seen with a relay-only local policy.
+        ice_transport_policy: RTCIceTransportPolicy::All,
         ..Default::default()
     }
 }
