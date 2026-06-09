@@ -151,6 +151,7 @@ struct IosRtcOfferResponse {
 #[serde(rename_all = "camelCase")]
 struct RtcIceConfigResponse {
     ice_servers: Vec<RtcIceServerConfig>,
+    #[serde(default = "default_ice_transport_policy")]
     ice_transport_policy: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
@@ -162,6 +163,10 @@ struct RtcIceConfigResponse {
     cf_api_token_configured: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+fn default_ice_transport_policy() -> String {
+    "all".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
