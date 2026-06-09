@@ -22,7 +22,7 @@ use axum::{
 };
 use bytes::Bytes as MediaBytes;
 use futures_util::{SinkExt, StreamExt};
-use http::{Method, StatusCode};
+use http::{header, HeaderValue, Method, StatusCode};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -219,6 +219,14 @@ struct RtcIceService {
     cache: Mutex<Option<RtcIceCache>>,
 }
 
+fn with_cors_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,POST,OPTIONS"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
+    response
+}
+
 impl RtcIceService {
     fn from_env() -> Self {
         let turn_enabled = env::var("RTC_TURN_ENABLED")
@@ -400,7 +408,7 @@ async fn ios_stream_handler(
         .registry
         .get_ios_device(&id)
         .await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
+        .ok_or_else(|| with_cors_headers((StatusCode::NOT_FOUND, "device not found").into_response()))?;
 
     Ok(ws.on_upgrade(move |socket| handle_ios_stream(socket, device.ip, 7001)))
 }
@@ -485,7 +493,7 @@ async fn ios_rtc_offer_handler(
             if let Some(cancel) = state.rtc_sessions.lock().await.remove(&id) {
                 cancel.cancel();
             }
-            return Err((StatusCode::BAD_GATEWAY, e).into_response());
+            return Err(with_cors_headers((StatusCode::BAD_GATEWAY, e).into_response()));
         }
     };
 
