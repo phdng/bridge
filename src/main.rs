@@ -167,11 +167,29 @@ struct RtcIceConfigResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RtcIceServerConfig {
+    #[serde(deserialize_with = "deserialize_ice_urls")]
     urls: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential: Option<String>,
+}
+
+fn deserialize_ice_urls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IceUrls {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    match IceUrls::deserialize(deserializer)? {
+        IceUrls::One(url) => Ok(vec![url]),
+        IceUrls::Many(urls) => Ok(urls),
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -295,9 +313,13 @@ impl RtcIceService {
             .map_err(|e| format!("request: {e}"))?
             .error_for_status()
             .map_err(|e| format!("status: {e}"))?
-            .json::<RtcIceConfigResponse>()
+            .text()
             .await
-            .map_err(|e| format!("decode: {e}"))?;
+            .map_err(|e| format!("read body: {e}"))?;
+        let config = serde_json::from_str::<RtcIceConfigResponse>(&config).map_err(|e| {
+            let body = config.chars().take(500).collect::<String>();
+            format!("decode: {e}; body={body}")
+        })?;
 
         let valid_for = self.ttl.saturating_sub(self.refresh_skew).max(60);
         let mut cache = self.cache.lock().await;
