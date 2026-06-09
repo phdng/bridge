@@ -152,6 +152,16 @@ struct IosRtcOfferResponse {
 struct RtcIceConfigResponse {
     ice_servers: Vec<RtcIceServerConfig>,
     ice_transport_policy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default)]
+    turn_enabled: bool,
+    #[serde(default)]
+    cf_app_id_configured: bool,
+    #[serde(default)]
+    cf_api_token_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -222,17 +232,28 @@ impl RtcIceService {
     async fn config(&self, force_relay: bool) -> RtcIceConfigResponse {
         let mut config = if self.turn_enabled {
             match self.cloudflare_config().await {
-                Ok(config) => config,
+                Ok(mut config) => {
+                    config.source = Some("cloudflare".to_string());
+                    config.error = None;
+                    config
+                }
                 Err(e) => {
                     println!("[rtc-ice] cloudflare TURN config failed: {e}; using STUN fallback");
-                    self.stun_fallback_config()
+                    let mut config = self.stun_fallback_config();
+                    config.error = Some(e);
+                    config
                 }
             }
         } else {
-            self.stun_fallback_config()
+            let mut config = self.stun_fallback_config();
+            config.error = Some("RTC_TURN_ENABLED is not enabled".to_string());
+            config
         };
 
         config.ice_transport_policy = if force_relay { "relay" } else { "all" }.to_string();
+        config.turn_enabled = self.turn_enabled;
+        config.cf_app_id_configured = self.cf_app_id.is_some();
+        config.cf_api_token_configured = self.cf_api_token.is_some();
         config
     }
 
@@ -300,6 +321,11 @@ impl RtcIceService {
         RtcIceConfigResponse {
             ice_servers,
             ice_transport_policy: "all".to_string(),
+            source: Some("stun-fallback".to_string()),
+            turn_enabled: self.turn_enabled,
+            cf_app_id_configured: self.cf_app_id.is_some(),
+            cf_api_token_configured: self.cf_api_token.is_some(),
+            error: None,
         }
     }
 }
