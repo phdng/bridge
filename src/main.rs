@@ -1085,9 +1085,9 @@ async fn main() {
                     "/",
                     get(|ws: WebSocketUpgrade| async { ws.on_upgrade(handle_websocket) }),
                 )
-                .route_layer(cors_layer()),
+                .layer(cors_layer()),
         )
-        .route_layer(cors_layer())
+        .layer(cors_layer())
         .fallback(proxy_request);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:15037")
