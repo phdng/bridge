@@ -43,10 +43,12 @@ mod adb;
 mod ios_lan_scanner;
 mod ios_provider;
 mod registry;
+mod workspace;
 
 use ios_lan_scanner::IosLanScanner;
 use ios_provider::IosProvider;
 use registry::DeviceRegistry;
+use workspace::{FileQuery, Workspace, WriteFileRequest};
 
 use webrtc::{
     api::{interceptor_registry::register_default_interceptors, media_engine::{MediaEngine, MIME_TYPE_H264}, APIBuilder},
@@ -131,6 +133,7 @@ struct AppState {
     registry: std::sync::Arc<DeviceRegistry>,
     rtc_sessions: Arc<Mutex<HashMap<String, CancellationToken>>>,
     rtc_ice: Arc<RtcIceService>,
+    workspace: Arc<Workspace>,
 }
 
 #[derive(Deserialize)]
@@ -399,6 +402,34 @@ fn to_webrtc_config(config: &RtcIceConfigResponse) -> RTCConfiguration {
 async fn list_devices(State(state): State<AppState>) -> impl IntoResponse {
     let devices = state.registry.list_unified_devices().await;
     Json(devices)
+}
+
+async fn list_workspace_files(
+    State(state): State<AppState>,
+    Query(query): Query<FileQuery>,
+) -> Result<impl IntoResponse, Response> {
+    state.workspace.list(query).await.map(Json).map_err(|error| error.into_response())
+}
+
+async fn read_workspace_file(
+    State(state): State<AppState>,
+    Query(query): Query<FileQuery>,
+) -> Result<impl IntoResponse, Response> {
+    state.workspace.read_file(query).await.map(Json).map_err(|error| error.into_response())
+}
+
+async fn write_workspace_file(
+    State(state): State<AppState>,
+    Json(request): Json<WriteFileRequest>,
+) -> Result<impl IntoResponse, Response> {
+    state.workspace.write_file(request).await.map(Json).map_err(|error| error.into_response())
+}
+
+async fn delete_workspace_file(
+    State(state): State<AppState>,
+    Query(query): Query<FileQuery>,
+) -> Result<impl IntoResponse, Response> {
+    state.workspace.delete_path(query).await.map(Json).map_err(|error| error.into_response())
 }
 
 async fn ios_stream_handler(
@@ -1079,6 +1110,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/devices", get(list_devices))
+        .route("/api/files", get(list_workspace_files))
+        .route("/api/file", get(read_workspace_file).put(write_workspace_file).delete(delete_workspace_file))
         .route("/ios/{id}/stream", get(ios_stream_handler))
         .route("/ios/{id}/stream-eco", get(ios_stream_eco_handler))
         .route("/ios/{id}/h264", get(ios_h264_handler))
@@ -1118,6 +1151,7 @@ async fn main() {
         registry,
         rtc_sessions: Arc::new(Mutex::new(HashMap::new())),
         rtc_ice: Arc::new(RtcIceService::from_env()),
+        workspace: Arc::new(Workspace::new().expect("workspace init failed")),
     });
 
     let mut server = {
