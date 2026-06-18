@@ -1309,7 +1309,7 @@ fn cors_layer() -> CorsLayer {
     // (e.g. https://app.example.com -> http://localhost:15037).
     // Use permissive CORS here to avoid deployment-specific origin drift.
     CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
         .allow_headers(Any)
         .allow_origin(Any)
         .allow_private_network(true)
