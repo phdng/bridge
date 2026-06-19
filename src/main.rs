@@ -29,8 +29,8 @@ use std::net::IpAddr;
 use tao::event_loop::EventLoopBuilder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::{mpsc::channel, Mutex},
+    net::{tcp::OwnedReadHalf, tcp::OwnedWriteHalf, TcpStream},
+    sync::{mpsc::{channel, Sender}, oneshot, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
@@ -132,8 +132,38 @@ async fn handle_websocket(ws: WebSocket) {
 struct AppState {
     registry: std::sync::Arc<DeviceRegistry>,
     rtc_sessions: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    zxtouch_hubs: Arc<Mutex<HashMap<String, Arc<ZxTouchControlHub>>>>,
     rtc_ice: Arc<RtcIceService>,
     workspace: Arc<Workspace>,
+}
+
+struct ZxTouchCommand {
+    bytes: Vec<u8>,
+    response_tx: oneshot::Sender<Result<Vec<u8>, ()>>,
+}
+
+struct ZxTouchControlHub {
+    command_tx: Sender<ZxTouchCommand>,
+    touch_tx: Sender<Vec<u8>>,
+}
+
+impl ZxTouchControlHub {
+    fn new(ip: String) -> Arc<Self> {
+        let (command_tx, command_rx) = channel::<ZxTouchCommand>(128);
+        let (touch_tx, touch_rx) = channel::<Vec<u8>>(128);
+        tokio::spawn(zxtouch_control_worker(ip, command_rx, touch_rx));
+        Arc::new(Self { command_tx, touch_tx })
+    }
+
+    async fn send_touch(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        self.touch_tx.send(bytes).await.map_err(|_| ())
+    }
+
+    async fn send_request(&self, bytes: Vec<u8>) -> Result<Vec<u8>, ()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx.send(ZxTouchCommand { bytes, response_tx }).await.map_err(|_| ())?;
+        response_rx.await.map_err(|_| ())?
+    }
 }
 
 #[derive(Deserialize)]
@@ -810,13 +840,101 @@ async fn ios_zxtouch_handler(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
 
     let registry = Arc::clone(&state.registry);
+    let hubs = Arc::clone(&state.zxtouch_hubs);
     Ok(ws.on_upgrade(move |socket| async move {
         registry.begin_ios_control();
         println!("[ios-zxtouch] control opened {id}");
-        handle_ios_zxtouch(socket, device.ip).await;
+        let hub = {
+            let mut guard = hubs.lock().await;
+            Arc::clone(guard.entry(device.ip.clone()).or_insert_with(|| ZxTouchControlHub::new(device.ip.clone())))
+        };
+        handle_ios_zxtouch(socket, hub).await;
         println!("[ios-zxtouch] control closed {id}");
         registry.end_ios_control();
     }))
+}
+
+async fn zxtouch_connect(ip: &str) -> Result<TcpStream, ()> {
+    let addr = format!("{}:6000", ip);
+    let stream = TcpStream::connect(addr).await.map_err(|_| ())?;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
+}
+
+async fn zxtouch_read_line(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = reader.read(&mut byte).await.map_err(|_| ())?;
+        if n == 0 { return Err(()); }
+        out.push(byte[0]);
+        if byte[0] == b'\n' { return Ok(out); }
+        if out.len() > 1024 * 1024 { return Err(()); }
+    }
+}
+
+async fn zxtouch_ensure_connection(
+    ip: &str,
+    reader: &mut Option<OwnedReadHalf>,
+    writer: &mut Option<OwnedWriteHalf>,
+) -> Result<(), ()> {
+    if reader.is_some() && writer.is_some() { return Ok(()); }
+    let stream = zxtouch_connect(ip).await?;
+    let (next_reader, next_writer) = stream.into_split();
+    *reader = Some(next_reader);
+    *writer = Some(next_writer);
+    Ok(())
+}
+
+async fn zxtouch_control_worker(
+    ip: String,
+    mut command_rx: tokio::sync::mpsc::Receiver<ZxTouchCommand>,
+    mut touch_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let mut reader: Option<OwnedReadHalf> = None;
+    let mut writer: Option<OwnedWriteHalf> = None;
+    loop {
+        tokio::select! {
+            touch = touch_rx.recv() => {
+                let Some(bytes) = touch else { break; };
+                if zxtouch_ensure_connection(&ip, &mut reader, &mut writer).await.is_err() { continue; }
+                if let Some(w) = writer.as_mut() {
+                    if w.write_all(&bytes).await.is_err() {
+                        reader = None;
+                        writer = None;
+                    }
+                }
+            }
+            command = command_rx.recv() => {
+                let Some(command) = command else { break; };
+                if zxtouch_ensure_connection(&ip, &mut reader, &mut writer).await.is_err() {
+                    let _ = command.response_tx.send(Err(()));
+                    continue;
+                }
+                let write_ok = if let Some(w) = writer.as_mut() {
+                    w.write_all(&command.bytes).await.is_ok()
+                } else {
+                    false
+                };
+                if !write_ok {
+                    reader = None;
+                    writer = None;
+                    let _ = command.response_tx.send(Err(()));
+                    continue;
+                }
+                let response = if let Some(r) = reader.as_mut() {
+                    zxtouch_read_line(r).await
+                } else {
+                    Err(())
+                };
+                if response.is_err() {
+                    reader = None;
+                    writer = None;
+                }
+                let _ = command.response_tx.send(response);
+            }
+        }
+    }
 }
 
 async fn handle_ios_stream(mut ws: WebSocket, ip: String, port: u16) {
@@ -902,103 +1020,32 @@ async fn handle_ios_stream(mut ws: WebSocket, ip: String, port: u16) {
     let _ = tcp_writer.shutdown().await;
 }
 
-async fn handle_ios_zxtouch(mut ws: WebSocket, ip: String) {
-    let addr = format!("{}:6000", ip);
-    let stream = match TcpStream::connect(addr).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            let _ = ws.close().await;
-            return;
+async fn handle_ios_zxtouch(mut ws: WebSocket, hub: Arc<ZxTouchControlHub>) {
+    while let Some(message) = ws.recv().await {
+        let bytes = match message {
+            Ok(Message::Binary(buf)) => buf.to_vec(),
+            Ok(Message::Text(text)) => text.as_bytes().to_vec(),
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => continue,
+        };
+
+        if is_ios_zxtouch_touch_command(&bytes) {
+            if hub.send_touch(bytes).await.is_err() { break; }
+            continue;
         }
-    };
 
-    let _ = stream.set_nodelay(true);
-
-    let (mut ws_writer, mut ws_reader) = ws.split();
-    let (mut tcp_reader, mut tcp_writer) = stream.into_split();
-    let cancel = CancellationToken::new();
-    let cancel_reader = cancel.clone();
-    let cancel_writer = cancel.clone();
-    let cancel_move = cancel.clone();
-    let cancel_command_writer = cancel.clone();
-    let (command_tx, mut command_rx) = channel::<Vec<u8>>(64);
-    let latest_move = Arc::new(Mutex::new(None::<Vec<u8>>));
-
-    let command_writer = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel_command_writer.cancelled() => break,
-                command = command_rx.recv() => {
-                    let Some(command) = command else { break; };
-                    if tcp_writer.write_all(&command).await.is_err() { break; }
-                }
+        match hub.send_request(bytes).await {
+            Ok(response) => {
+                if ws.send(Message::binary(response)).await.is_err() { break; }
             }
+            Err(_) => break,
         }
-        cancel_command_writer.cancel();
-    });
+    }
+    let _ = ws.close().await;
+}
 
-    let latest_move_for_pump = Arc::clone(&latest_move);
-    let command_tx_for_pump = command_tx.clone();
-    let move_pump = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            tokio::select! {
-                _ = cancel_move.cancelled() => break,
-                _ = tick.tick() => {
-                    let command = latest_move_for_pump.lock().await.take();
-                    if let Some(command) = command {
-                        if command_tx_for_pump.send(command).await.is_err() { break; }
-                    }
-                }
-            }
-        }
-        cancel_move.cancel();
-    });
-
-    let latest_move_for_reader = Arc::clone(&latest_move);
-    let command_tx_for_reader = command_tx.clone();
-    let ws_to_tcp = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel_reader.cancelled() => break,
-                message = ws_reader.next() => {
-                    match message {
-                        Some(Ok(Message::Binary(buf))) => {
-                            if forward_ios_zxtouch_command(buf.to_vec(), &latest_move_for_reader, &command_tx_for_reader).await.is_err() { break; }
-                        }
-                        Some(Ok(Message::Text(text))) => {
-                            if forward_ios_zxtouch_command(text.as_bytes().to_vec(), &latest_move_for_reader, &command_tx_for_reader).await.is_err() { break; }
-                        }
-                        Some(Ok(Message::Close(_))) | None => break,
-                        Some(Ok(_)) => {}
-                        Some(Err(_)) => break,
-                    }
-                }
-            }
-        }
-        cancel_reader.cancel();
-    });
-
-    let tcp_to_ws = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            tokio::select! {
-                _ = cancel_writer.cancelled() => break,
-                result = tcp_reader.read(&mut buf) => {
-                    let n = match result {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    if ws_writer.send(Message::binary(buf[..n].to_vec())).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        cancel_writer.cancel();
-    });
-
-    let _ = tokio::join!(ws_to_tcp, command_writer, move_pump, tcp_to_ws);
+fn is_ios_zxtouch_touch_command(command: &[u8]) -> bool {
+    command.starts_with(b"10")
 }
 
 async fn forward_ios_zxtouch_command(
@@ -1150,6 +1197,7 @@ async fn main() {
     let app = app.with_state(AppState {
         registry,
         rtc_sessions: Arc::new(Mutex::new(HashMap::new())),
+        zxtouch_hubs: Arc::new(Mutex::new(HashMap::new())),
         rtc_ice: Arc::new(RtcIceService::from_env()),
         workspace: Arc::new(Workspace::new().expect("workspace init failed")),
     });
