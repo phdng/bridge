@@ -132,26 +132,26 @@ async fn handle_websocket(ws: WebSocket) {
 struct AppState {
     registry: std::sync::Arc<DeviceRegistry>,
     rtc_sessions: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    zxtouch_hubs: Arc<Mutex<HashMap<String, Arc<ZxTouchControlHub>>>>,
+    tlinkauto_hubs: Arc<Mutex<HashMap<String, Arc<TLinkautoControlHub>>>>,
     rtc_ice: Arc<RtcIceService>,
     workspace: Arc<Workspace>,
 }
 
-struct ZxTouchCommand {
+struct TLinkautoCommand {
     bytes: Vec<u8>,
     response_tx: oneshot::Sender<Result<Vec<u8>, ()>>,
 }
 
-struct ZxTouchControlHub {
-    command_tx: Sender<ZxTouchCommand>,
+struct TLinkautoControlHub {
+    command_tx: Sender<TLinkautoCommand>,
     touch_tx: Sender<Vec<u8>>,
 }
 
-impl ZxTouchControlHub {
+impl TLinkautoControlHub {
     fn new(ip: String) -> Arc<Self> {
-        let (command_tx, command_rx) = channel::<ZxTouchCommand>(128);
+        let (command_tx, command_rx) = channel::<TLinkautoCommand>(128);
         let (touch_tx, touch_rx) = channel::<Vec<u8>>(128);
-        tokio::spawn(zxtouch_control_worker(ip, command_rx, touch_rx));
+        tokio::spawn(tlinkauto_control_worker(ip, command_rx, touch_rx));
         Arc::new(Self { command_tx, touch_tx })
     }
 
@@ -161,7 +161,7 @@ impl ZxTouchControlHub {
 
     async fn send_request(&self, bytes: Vec<u8>) -> Result<Vec<u8>, ()> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx.send(ZxTouchCommand { bytes, response_tx }).await.map_err(|_| ())?;
+        self.command_tx.send(TLinkautoCommand { bytes, response_tx }).await.map_err(|_| ())?;
         response_rx.await.map_err(|_| ())?
     }
 }
@@ -641,7 +641,7 @@ async fn create_ios_rtc_answer(
             ..Default::default()
         },
         "ios-video".to_string(),
-        "zxtouch".to_string(),
+        "tlinkauto".to_string(),
     ));
 
     let rtp_sender = peer_connection
@@ -750,7 +750,7 @@ async fn stream_ios_h264_to_rtc(
         let now = Instant::now();
         if let Some(last) = last_frame_at {
             let observed_us = now.duration_since(last).as_micros() as f64;
-            // Track real source pacing smoothly. During zxtouch input, capture can dip below
+            // Track real source pacing smoothly. During TLinkauto input, capture can dip below
             // 30fps; fixed 30fps RTP timestamps make the browser grow its jitter buffer.
             let bounded_us = observed_us.clamp(30_000.0, 60_000.0);
             sample_duration_us = (sample_duration_us * 0.80) + (bounded_us * 0.20);
@@ -828,7 +828,7 @@ async fn read_zxh_frame(reader: &mut TcpStream) -> Result<Option<ZxhFrame>, std:
     Ok(Some(ZxhFrame { timestamp_us, payload }))
 }
 
-async fn ios_zxtouch_handler(
+async fn ios_tlinkauto_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
@@ -840,28 +840,28 @@ async fn ios_zxtouch_handler(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "device not found").into_response())?;
 
     let registry = Arc::clone(&state.registry);
-    let hubs = Arc::clone(&state.zxtouch_hubs);
+    let hubs = Arc::clone(&state.tlinkauto_hubs);
     Ok(ws.on_upgrade(move |socket| async move {
         registry.begin_ios_control();
-        println!("[ios-zxtouch] control opened {id}");
+        println!("[ios-tlinkauto] control opened {id}");
         let hub = {
             let mut guard = hubs.lock().await;
-            Arc::clone(guard.entry(device.ip.clone()).or_insert_with(|| ZxTouchControlHub::new(device.ip.clone())))
+            Arc::clone(guard.entry(device.ip.clone()).or_insert_with(|| TLinkautoControlHub::new(device.ip.clone())))
         };
-        handle_ios_zxtouch(socket, hub).await;
-        println!("[ios-zxtouch] control closed {id}");
+        handle_ios_tlinkauto(socket, hub).await;
+        println!("[ios-tlinkauto] control closed {id}");
         registry.end_ios_control();
     }))
 }
 
-async fn zxtouch_connect(ip: &str) -> Result<TcpStream, ()> {
+async fn tlinkauto_connect(ip: &str) -> Result<TcpStream, ()> {
     let addr = format!("{}:6000", ip);
     let stream = TcpStream::connect(addr).await.map_err(|_| ())?;
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
 
-async fn zxtouch_read_line(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, ()> {
+async fn tlinkauto_read_line(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, ()> {
     let mut out = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     loop {
@@ -873,22 +873,22 @@ async fn zxtouch_read_line(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, ()> {
     }
 }
 
-async fn zxtouch_ensure_connection(
+async fn tlinkauto_ensure_connection(
     ip: &str,
     reader: &mut Option<OwnedReadHalf>,
     writer: &mut Option<OwnedWriteHalf>,
 ) -> Result<(), ()> {
     if reader.is_some() && writer.is_some() { return Ok(()); }
-    let stream = zxtouch_connect(ip).await?;
+    let stream = tlinkauto_connect(ip).await?;
     let (next_reader, next_writer) = stream.into_split();
     *reader = Some(next_reader);
     *writer = Some(next_writer);
     Ok(())
 }
 
-async fn zxtouch_control_worker(
+async fn tlinkauto_control_worker(
     ip: String,
-    mut command_rx: tokio::sync::mpsc::Receiver<ZxTouchCommand>,
+    mut command_rx: tokio::sync::mpsc::Receiver<TLinkautoCommand>,
     mut touch_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     let mut reader: Option<OwnedReadHalf> = None;
@@ -897,7 +897,7 @@ async fn zxtouch_control_worker(
         tokio::select! {
             touch = touch_rx.recv() => {
                 let Some(bytes) = touch else { break; };
-                if zxtouch_ensure_connection(&ip, &mut reader, &mut writer).await.is_err() { continue; }
+                if tlinkauto_ensure_connection(&ip, &mut reader, &mut writer).await.is_err() { continue; }
                 if let Some(w) = writer.as_mut() {
                     if w.write_all(&bytes).await.is_err() {
                         reader = None;
@@ -907,7 +907,7 @@ async fn zxtouch_control_worker(
             }
             command = command_rx.recv() => {
                 let Some(command) = command else { break; };
-                if zxtouch_ensure_connection(&ip, &mut reader, &mut writer).await.is_err() {
+                if tlinkauto_ensure_connection(&ip, &mut reader, &mut writer).await.is_err() {
                     let _ = command.response_tx.send(Err(()));
                     continue;
                 }
@@ -923,7 +923,7 @@ async fn zxtouch_control_worker(
                     continue;
                 }
                 let response = if let Some(r) = reader.as_mut() {
-                    zxtouch_read_line(r).await
+                    tlinkauto_read_line(r).await
                 } else {
                     Err(())
                 };
@@ -1020,7 +1020,7 @@ async fn handle_ios_stream(mut ws: WebSocket, ip: String, port: u16) {
     let _ = tcp_writer.shutdown().await;
 }
 
-async fn handle_ios_zxtouch(mut ws: WebSocket, hub: Arc<ZxTouchControlHub>) {
+async fn handle_ios_tlinkauto(mut ws: WebSocket, hub: Arc<TLinkautoControlHub>) {
     while let Some(message) = ws.recv().await {
         let bytes = match message {
             Ok(Message::Binary(buf)) => buf.to_vec(),
@@ -1029,7 +1029,7 @@ async fn handle_ios_zxtouch(mut ws: WebSocket, hub: Arc<ZxTouchControlHub>) {
             Ok(_) => continue,
         };
 
-        if is_ios_zxtouch_touch_command(&bytes) {
+        if is_ios_tlinkauto_touch_command(&bytes) {
             if hub.send_touch(bytes).await.is_err() { break; }
             continue;
         }
@@ -1044,11 +1044,11 @@ async fn handle_ios_zxtouch(mut ws: WebSocket, hub: Arc<ZxTouchControlHub>) {
     let _ = ws.close().await;
 }
 
-fn is_ios_zxtouch_touch_command(command: &[u8]) -> bool {
+fn is_ios_tlinkauto_touch_command(command: &[u8]) -> bool {
     command.starts_with(b"10")
 }
 
-async fn forward_ios_zxtouch_command(
+async fn forward_ios_tlinkauto_command(
     command: Vec<u8>,
     latest_move: &Arc<Mutex<Option<Vec<u8>>>>,
     command_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -1166,7 +1166,7 @@ async fn main() {
         .route("/rtc/config", get(rtc_config_handler))
         .route("/ios/{id}/rtc/offer", post(ios_rtc_offer_handler))
         .route("/ios/{id}/rtc/close", post(ios_rtc_close_handler))
-        .route("/ios/{id}/zxtouch", get(ios_zxtouch_handler))
+        .route("/ios/{id}/tlinkauto", get(ios_tlinkauto_handler))
         .nest(
             "/bridge",
             Router::new()
@@ -1197,7 +1197,7 @@ async fn main() {
     let app = app.with_state(AppState {
         registry,
         rtc_sessions: Arc::new(Mutex::new(HashMap::new())),
-        zxtouch_hubs: Arc::new(Mutex::new(HashMap::new())),
+        tlinkauto_hubs: Arc::new(Mutex::new(HashMap::new())),
         rtc_ice: Arc::new(RtcIceService::from_env()),
         workspace: Arc::new(Workspace::new().expect("workspace init failed")),
     });
