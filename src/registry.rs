@@ -111,7 +111,7 @@ impl DeviceRegistry {
                 meta: json!({
                     "ip": device.ip,
                     "device": device.status.device,
-                    "zxtouch": device.status.zxtouch,
+                    "tlinkauto": device.status.tlinkauto,
                     "script": device.status.script,
                 }),
                 capabilities: vec![
@@ -119,7 +119,7 @@ impl DeviceRegistry {
                     "stream_h264_ws".to_string(),
                     "stream_h264_worker_ws".to_string(),
                     "stream_rtc_auto".to_string(),
-                    "zxtouch".to_string(),
+                    "tlinkauto".to_string(),
                 ],
             });
         }
