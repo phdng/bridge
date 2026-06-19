@@ -9,13 +9,13 @@ use crate::{
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HelloStatusPayload {
-    pub zxtouch: ZxTouch,
+    pub tlinkauto: TLinkauto,
     pub device: IosDeviceInfo,
     pub script: ScriptStatus,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ZxTouch {
+pub struct TLinkauto {
     pub port: u16,
     pub protocols: Vec<String>,
 }
@@ -62,6 +62,11 @@ impl IosProvider {
     pub fn start(self) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
+                if self.registry.has_active_ios_control() {
+                    sleep(self.interval).await;
+                    continue;
+                }
+
                 if let Ok(local_ip) = local_ipv4() {
                     let subnet = subnet_base(local_ip);
                     let devices = self.scanner.scan_subnet(subnet).await;
